@@ -201,6 +201,7 @@ protected:
   // transform stuff
   tf2::Vector3 tcp_force_;
   tf2::Vector3 tcp_torque_;
+  double ft_sensor_exponential_filter_alpha_;
 
   // asynchronous commands
   std::array<double, 18> standard_dig_out_bits_cmd_;

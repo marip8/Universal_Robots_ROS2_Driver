@@ -41,6 +41,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <Eigen/Dense>
 
 #include "ur_client_library/exceptions.h"
 #include "ur_client_library/ur/tool_communication.h"
@@ -100,6 +101,7 @@ URPositionHardwareInterface::on_init(const hardware_interface::HardwareInfo& sys
   trajectory_joint_positions_.clear();
   trajectory_joint_velocities_.clear();
   trajectory_joint_accelerations_.clear();
+  ft_sensor_exponential_filter_alpha_ = 1.0;
 
   for (const hardware_interface::ComponentInfo& joint : info_.joints) {
     if (joint.command_interfaces.size() != 2) {
@@ -520,6 +522,11 @@ URPositionHardwareInterface::on_configure(const rclcpp_lifecycle::State& previou
                         "README.md] for details.");
   }
 
+  // Get the alpha value for the FT sensor exponential filter
+  std::string alpha = info_.hardware_parameters.at("ft_sensor_exponential_filter_alpha");
+  RCLCPP_INFO_STREAM(rclcpp::get_logger("URPositionHardwareInterface"), "FT sensor exponential filter alpha: " << alpha);
+  ft_sensor_exponential_filter_alpha_ = std::stod(alpha);
+
   // Export version information to state interfaces
   urcl::VersionInformation version_info = ur_driver_->getVersion();
   get_robot_software_version_major_ = version_info.major;
@@ -598,6 +605,22 @@ void URPositionHardwareInterface::asyncThread()
   }
 }
 
+template<std::size_t N>
+static std::array<double, N> exponentialFilter(const std::array<double, N>& previous_arr,
+                                               const std::array<double, N>& current_arr,
+                                               double alpha)
+{
+  Eigen::Map<const Eigen::Array<double, N, 1>> previous(previous_arr.data());
+  Eigen::Map<const Eigen::Array<double, N, 1>> current(current_arr.data());
+
+  std::array<double, N> output_arr;
+  Eigen::Map<Eigen::Array<double, N, 1>> output(output_arr.data());
+
+  output = alpha * current + (1.0 - alpha) * previous;
+
+  return output_arr;
+}
+
 hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::Time& time,
                                                                   const rclcpp::Duration& period)
 {
@@ -618,7 +641,6 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
     readData(data_pkg, "target_speed_fraction", target_speed_fraction_);
     readData(data_pkg, "speed_scaling", speed_scaling_);
     readData(data_pkg, "runtime_state", runtime_state_);
-    readData(data_pkg, "actual_TCP_force", urcl_ft_sensor_measurements_);
     readData(data_pkg, "actual_TCP_pose", urcl_tcp_pose_);
     readData(data_pkg, "standard_analog_input0", standard_analog_input_[0]);
     readData(data_pkg, "standard_analog_input1", standard_analog_input_[1]);
@@ -641,7 +663,17 @@ hardware_interface::return_type URPositionHardwareInterface::read(const rclcpp::
 
     // required transforms
     extractToolPose();
-    transformForceTorque();
+
+    // Force torque data
+    //   Save the previous (transformed) measurement for filtering
+    urcl::vector6d_t previous = urcl_ft_sensor_measurements_;
+    //   Read the current values and transform into the end effector frame
+    {
+      readData(data_pkg, "actual_TCP_force", urcl_ft_sensor_measurements_);
+      transformForceTorque();
+    }
+    //   Apply an exponential filter after the `transformForceTorque` method has been called
+    urcl_ft_sensor_measurements_ = exponentialFilter(previous, urcl_ft_sensor_measurements_, ft_sensor_exponential_filter_alpha_);
 
     // TODO(anyone): logic for sending other stuff to higher level interface
 
